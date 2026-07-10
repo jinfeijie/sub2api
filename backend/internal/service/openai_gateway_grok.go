@@ -168,6 +168,10 @@ func patchGrokResponsesBody(body []byte, upstreamModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	out, err = sanitizeGrokResponsesInput(out)
+	if err != nil {
+		return nil, err
+	}
 	out, err = sanitizeGrokResponsesTools(out)
 	if err != nil {
 		return nil, err
@@ -221,6 +225,41 @@ func deleteJSONFields(value any, fields map[string]struct{}) bool {
 	default:
 		return false
 	}
+}
+
+// grokResponsesUnsupportedInputTypes are Codex/OpenAI private input item types
+// that xAI Responses rejects with:
+// "Failed to deserialize the JSON body into the target type: data did not match any variant of untagged enum ModelInput".
+var grokResponsesUnsupportedInputTypes = map[string]struct{}{
+	"additional_tools": {},
+}
+
+func sanitizeGrokResponsesInput(body []byte) ([]byte, error) {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body, nil
+	}
+
+	rawItems := input.Array()
+	filtered := make([]json.RawMessage, 0, len(rawItems))
+	dropped := false
+	for _, item := range rawItems {
+		itemType := strings.TrimSpace(item.Get("type").String())
+		if _, unsupported := grokResponsesUnsupportedInputTypes[itemType]; unsupported {
+			dropped = true
+			continue
+		}
+		filtered = append(filtered, json.RawMessage(item.Raw))
+	}
+	if !dropped {
+		return body, nil
+	}
+
+	encoded, err := json.Marshal(filtered)
+	if err != nil {
+		return nil, err
+	}
+	return sjson.SetRawBytes(body, "input", encoded)
 }
 
 var grokResponsesSupportedToolTypes = map[string]struct{}{
