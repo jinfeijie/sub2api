@@ -24,6 +24,16 @@ func TestAccountRepository_SetTempUnschedulable_NoRowsAffectedDoesNotWriteOutbox
 	require.NotContains(t, strings.Join(exec.execQueries, "\n"), "scheduler_outbox")
 }
 
+func TestAccountRepository_SetTempUnschedulable_UpdatesEqualWindowReason(t *testing.T) {
+	exec := &recordingSQLExecutor{result: rowsAffectedResult(1)}
+	repo := newAccountRepositoryWithSQL(nil, exec, nil)
+
+	err := repo.SetTempUnschedulable(context.Background(), 42, time.Now().Add(10*time.Minute), "spending-limit")
+	require.NoError(t, err)
+	require.NotEmpty(t, exec.execQueries)
+	require.Contains(t, normalizeSQLWhitespace(exec.execQueries[0]), "temp_unschedulable_until <= $1")
+}
+
 func TestAccountRepository_ListOAuthRefreshCandidates_SQLFilter(t *testing.T) {
 	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
 	require.NoError(t, err)

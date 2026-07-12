@@ -339,6 +339,7 @@ describe('AccountUsageCell', () => {
     // 手动刷新再拉一次
     expect(getUsage).toHaveBeenCalledTimes(2)
     expect(getUsage).toHaveBeenCalledWith(2010)
+    expect(getUsage).toHaveBeenNthCalledWith(2, 2010)
     // 单一数据源：始终使用 /usage API 值
     expect(wrapper.text()).toContain('5h|18|900')
   })
@@ -616,6 +617,129 @@ describe('AccountUsageCell', () => {
     const badges = wrapper.findAll('span[title]')
     expect(badges.some(node => node.attributes('title') === 'usage.accountBilled')).toBe(true)
     expect(badges.some(node => node.attributes('title') === 'usage.userBilled')).toBe(true)
+  })
+
+  it('Grok monthly-only billing 不会误显示 7d 周限', async () => {
+    getUsage.mockResolvedValue({
+      subscription_tier: 'SuperGrok',
+      grok_billing: {
+        period_type: 'monthly',
+        usage_percent: 50,
+        used_percent: 50,
+        monthly_limit_cents: 15000,
+        included_used_cents: 7500,
+        billing_period_end: '2026-08-01T00:00:00Z'
+      },
+      grok_local_usage_7d: {
+        requests: 3,
+        tokens: 900,
+        cost: 0.25,
+        standard_cost: 0.25,
+        user_cost: 0.5
+      },
+      grok_local_usage_monthly: {
+        requests: 8,
+        tokens: 2400,
+        cost: 0.75,
+        standard_cost: 0.75,
+        user_cost: 1.25
+      },
+      grok_quota_snapshot_state: 'billing_observed'
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 3862, platform: 'grok', type: 'oauth', extra: {} })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: {
+            props: ['label', 'utilization', 'resetsAt', 'windowStats'],
+            template: '<div class="usage-bar">{{ label }}|{{ utilization }}|{{ resetsAt }}|{{ windowStats?.requests }}|{{ windowStats?.tokens }}|{{ windowStats?.cost }}|{{ windowStats?.user_cost }}</div>'
+          },
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: true
+        }
+      }
+    })
+
+    await flushPromises()
+
+    expect(wrapper.text()).not.toContain('7d|')
+    expect(wrapper.text()).toContain('admin.accounts.usageWindow.grokMonthlyBarLabel|50|2026-08-01T00:00:00Z|8|2400|0.75|1.25')
+    expect(wrapper.text()).toContain('$75/$150')
+    expect(wrapper.text()).not.toContain('3 req')
+    expect(wrapper.text()).not.toContain('SuperGrok')
+  })
+
+  it('Grok 手动刷新会强制重新探测账单额度', async () => {
+    getUsage.mockResolvedValue({
+      subscription_tier: 'SuperGrok',
+      grok_billing: {
+        period_type: 'weekly',
+        usage_percent: 10,
+        period_end: '2026-07-16T00:00:00Z'
+      },
+      grok_quota_snapshot_state: 'billing_observed'
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 3863, platform: 'grok', type: 'oauth', extra: {} }),
+        manualRefreshToken: 0
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: true,
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: true
+        }
+      }
+    })
+
+    await flushPromises()
+    expect(getUsage).toHaveBeenNthCalledWith(1, 3863)
+
+    await wrapper.setProps({ manualRefreshToken: 1 })
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenNthCalledWith(2, 3863, undefined, true)
+  })
+
+  it('Grok Query 直接采用后端返回的周期统计且不重复请求 usage', async () => {
+    getUsage.mockResolvedValue({
+      grok_quota_snapshot_state: 'unknown_until_billing_or_response',
+      error_code: 'quota_unknown',
+      error: 'unknown'
+    })
+
+    const wrapper = mount(AccountUsageCell, {
+      props: {
+        account: makeAccount({ id: 3864, platform: 'grok', type: 'oauth', extra: {} })
+      },
+      global: {
+        stubs: {
+          UsageProgressBar: {
+            props: ['label', 'windowStats'],
+            template: '<div class="usage-bar">{{ label }}|{{ windowStats?.requests }}</div>'
+          },
+          AccountQuotaInfo: true,
+          GrokQuotaProbeCell: {
+            emits: ['probed'],
+            template: '<button class="probe" @click="$emit(\'probed\', { source: \'active_probe\', billing: { period_type: \'weekly\', usage_percent: 10, period_end: \'2026-07-16T00:00:00Z\' }, local_usage_7d: { requests: 4, tokens: 10, cost: 1, standard_cost: 1, user_cost: 1 }, local_usage_monthly: { requests: 7, tokens: 20, cost: 2, standard_cost: 2, user_cost: 2 }, fetched_at: 1, persisted: true })">probe</button>'
+          }
+        }
+      }
+    })
+
+    await flushPromises()
+    expect(getUsage).toHaveBeenCalledTimes(1)
+
+    await wrapper.get('.probe').trigger('click')
+    await flushPromises()
+
+    expect(getUsage).toHaveBeenCalledTimes(1)
+    expect(wrapper.text()).toContain('7d|4')
   })
 
   it('Key 账号在 today stats loading 时显示骨架屏', async () => {

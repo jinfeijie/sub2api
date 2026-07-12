@@ -99,7 +99,7 @@ const typeLabel = computed(() => {
 
 const planLabel = computed(() => {
   if (!props.planType) return ''
-  const lower = props.planType.toLowerCase()
+  const lower = props.planType.toLowerCase().replace(/\s+/g, '')
   switch (lower) {
     case 'plus':
       return 'Plus'
@@ -110,6 +110,10 @@ const planLabel = computed(() => {
       return 'Pro'
     case 'free':
       return 'Free'
+    case 'supergrok':
+      return 'SuperGrok'
+    case 'supergrokheavy':
+      return 'SuperGrok Heavy'
     case 'abnormal':
       return t('admin.accounts.subscriptionAbnormal')
     default:

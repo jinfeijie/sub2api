@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -662,35 +663,184 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 	}
 	switch statusCode {
 	case http.StatusUnauthorized:
-		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok oauth token unauthorized")
+		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, http.StatusUnauthorized, "unauthorized", "grok oauth token unauthorized", responseBody)
 	case http.StatusForbidden:
-		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, "grok entitlement or subscription tier denied")
+		// Weekly/monthly credit exhaustion is returned by xAI as 403 with a spending-limit
+		// body (not 429). Only then pin unschedulable until the billing window end.
+		if keyword := grokSpendingLimitMatchedKeyword(responseBody); keyword != "" {
+			if until, reason, ok := resolveGrokSpendingLimitUntil(account, time.Now()); ok {
+				s.tempUnscheduleGrokUntil(ctx, account, until, http.StatusForbidden, keyword, reason, responseBody)
+				break
+			}
+		}
+		s.tempUnscheduleGrok(ctx, account, 30*time.Minute, http.StatusForbidden, "forbidden", "grok entitlement or subscription tier denied", responseBody)
 	case http.StatusTooManyRequests:
 		cooldown := 2 * time.Minute
 		if snapshot := xai.ParseQuotaHeaders(headers, statusCode); snapshot != nil && snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
 			cooldown = time.Duration(*snapshot.RetryAfterSeconds) * time.Second
 		}
-		s.tempUnscheduleGrok(ctx, account, cooldown, "grok rate limited")
+		s.tempUnscheduleGrok(ctx, account, cooldown, http.StatusTooManyRequests, "rate_limit", "grok rate limited", responseBody)
 	default:
 		if statusCode >= 500 {
-			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
+			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, statusCode, "upstream_5xx", "grok upstream temporary error", responseBody)
 		}
 	}
-	_ = responseBody
 }
 
-func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {
+// grokSpendingLimitMatchedKeyword matches the known xAI body for credit/weekly limit exhaustion.
+// Real example:
+//
+//	{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription..."}
+func grokSpendingLimitMatchedKeyword(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "code").String()))
+	if code == "" {
+		code = strings.ToLower(strings.TrimSpace(extractUpstreamErrorCode(body)))
+	}
+	// Grok uses top-level "error" as a string, not {"error":{"message":...}}.
+	msg := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error").String()))
+	if msg == "" || strings.HasPrefix(msg, "{") {
+		msg = strings.ToLower(strings.TrimSpace(extractUpstreamErrorMessage(body)))
+	}
+	haystack := code + "\n" + msg
+	for _, keyword := range []string{
+		"personal-team-blocked:spending-limit",
+		"spending-limit",
+		"run out of credits",
+	} {
+		if strings.Contains(haystack, keyword) {
+			return keyword
+		}
+	}
+	return ""
+}
+
+// resolveGrokSpendingLimitUntil uses a known future billing reset after the
+// upstream has definitively rejected a real request for spending-limit.
+func resolveGrokSpendingLimitUntil(account *Account, now time.Time) (time.Time, string, bool) {
+	if account == nil {
+		return time.Time{}, "", false
+	}
+	billing, err := grokBillingSnapshotFromExtra(account.Extra)
+	if err != nil || billing == nil {
+		return time.Time{}, "", false
+	}
+
+	type resetCandidate struct {
+		until  time.Time
+		reason string
+	}
+	candidates := make([]resetCandidate, 0, 2)
+	weeklyExhausted := billing.UsagePercent != nil && *billing.UsagePercent >= 100
+	monthlyExhausted := billing.UsedPercent != nil && *billing.UsedPercent >= 100
+	if until, ok := parseGrokBillingTime(billing.PeriodEnd); ok && until.After(now) {
+		if weeklyExhausted || !monthlyExhausted {
+			candidates = append(candidates, resetCandidate{until: until, reason: "grok weekly spending limit exhausted"})
+		}
+	}
+	if until, ok := parseGrokBillingTime(billing.BillingPeriodEnd); ok && until.After(now) {
+		if monthlyExhausted || !weeklyExhausted {
+			candidates = append(candidates, resetCandidate{until: until, reason: "grok monthly spending limit exhausted"})
+		}
+	}
+	if len(candidates) == 0 {
+		return time.Time{}, "", false
+	}
+	selected := candidates[0]
+	for _, candidate := range candidates[1:] {
+		// If no counter identifies the exhausted window, keep the account paused
+		// until every possible window has reset.
+		if candidate.until.After(selected.until) {
+			selected = candidate
+		}
+	}
+	return selected.until, selected.reason, true
+}
+
+func parseGrokBillingTime(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := parseTime(raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func (s *OpenAIGatewayService) tempUnscheduleGrok(
+	ctx context.Context,
+	account *Account,
+	cooldown time.Duration,
+	statusCode int,
+	matchedKeyword string,
+	reason string,
+	responseBody []byte,
+) {
 	if s == nil || account == nil {
 		return
 	}
-	until := time.Now().Add(cooldown)
-	if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(until) {
-		until = *account.TempUnschedulableUntil
+	if cooldown <= 0 {
+		cooldown = 2 * time.Minute
 	}
-	s.BlockAccountScheduling(account, until, reason)
+	s.tempUnscheduleGrokUntil(ctx, account, time.Now().Add(cooldown), statusCode, matchedKeyword, reason, responseBody)
+}
+
+func (s *OpenAIGatewayService) tempUnscheduleGrokUntil(
+	ctx context.Context,
+	account *Account,
+	until time.Time,
+	statusCode int,
+	matchedKeyword string,
+	reason string,
+	responseBody []byte,
+) {
+	if s == nil || account == nil || until.IsZero() {
+		return
+	}
+	runtimeUntil := until
+	if account.TempUnschedulableUntil != nil && account.TempUnschedulableUntil.After(runtimeUntil) {
+		runtimeUntil = *account.TempUnschedulableUntil
+	}
+
+	now := time.Now()
+	errorMessage := strings.TrimSpace(reason)
+	if bodyMsg := truncateTempUnschedMessage(responseBody, tempUnschedMessageMaxBytes); bodyMsg != "" {
+		errorMessage = bodyMsg
+	} else if errorMessage == "" {
+		errorMessage = "grok temporary unschedulable"
+	}
+	if matchedKeyword == "" {
+		matchedKeyword = "grok"
+	}
+
+	// Store structured TempUnschedState JSON so admin UI can show trigger time /
+	// status code / matched keyword (same shape as rule-based temp unsched).
+	state := &TempUnschedState{
+		UntilUnix:       until.Unix(),
+		TriggeredAtUnix: now.Unix(),
+		StatusCode:      statusCode,
+		MatchedKeyword:  matchedKeyword,
+		RuleIndex:       -1, // system-level Grok readiness path, not a user rule
+		ErrorMessage:    errorMessage,
+	}
+	reasonJSON := ""
+	if raw, err := json.Marshal(state); err == nil {
+		reasonJSON = string(raw)
+	}
+	if reasonJSON == "" {
+		reasonJSON = errorMessage
+	}
+
+	s.BlockAccountScheduling(account, runtimeUntil, reasonJSON)
 	if s.accountRepo != nil {
 		stateCtx, cancel := openAIAccountStateContext(ctx)
 		defer cancel()
-		_ = s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reason)
+		if err := s.accountRepo.SetTempUnschedulable(stateCtx, account.ID, until, reasonJSON); err != nil {
+			slog.Warn("grok_set_temp_unschedulable_failed", "account_id", account.ID, "error", err)
+		}
 	}
 }

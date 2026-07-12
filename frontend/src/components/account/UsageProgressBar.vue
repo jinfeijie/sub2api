@@ -27,9 +27,14 @@
 
     <!-- Progress bar row -->
     <div class="flex items-center gap-1">
-      <!-- Label badge (fixed width for alignment) -->
+      <!-- Label badge -->
       <span
-        :class="['w-[32px] shrink-0 rounded px-1 text-center text-[10px] font-medium', labelClass]"
+        :class="[
+          'shrink-0 rounded px-1 text-center text-[10px] font-medium',
+          wideLabel ? 'max-w-[72px] truncate' : 'w-[32px]',
+          labelClass
+        ]"
+        :title="wideLabel ? label : undefined"
       >
         {{ label }}
       </span>
@@ -62,14 +67,20 @@ import { useI18n } from 'vue-i18n'
 import type { WindowStats } from '@/types'
 import { formatCompactNumber } from '@/utils/format'
 
-const props = defineProps<{
-  label: string
-  utilization: number // Percentage (0-100+)
-  resetsAt?: string | null
-  color: 'indigo' | 'emerald' | 'purple' | 'amber'
-  windowStats?: WindowStats | null
-  showNowWhenIdle?: boolean
-}>()
+const props = withDefaults(
+  defineProps<{
+    label: string
+    utilization: number // Percentage (0-100+)
+    resetsAt?: string | null
+    color: 'indigo' | 'emerald' | 'purple' | 'amber'
+    windowStats?: WindowStats | null
+    showNowWhenIdle?: boolean
+    wideLabel?: boolean
+  }>(),
+  {
+    wideLabel: false
+  }
+)
 
 const { t } = useI18n()
 
