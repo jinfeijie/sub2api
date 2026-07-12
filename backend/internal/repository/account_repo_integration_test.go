@@ -807,6 +807,20 @@ func (s *AccountRepoSuite) TestSetTempUnschedulableSkipsOutboxWhenWindowDoesNotE
 	s.Require().WithinDuration(until, *got.TempUnschedulableUntil, time.Second)
 }
 
+func (s *AccountRepoSuite) TestSetTempUnschedulableUpdatesReasonForEqualWindow() {
+	account := mustCreateAccount(s.T(), s.client, &service.Account{Name: "acc-temp-equal"})
+	until := time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second)
+
+	s.Require().NoError(s.repo.SetTempUnschedulable(s.ctx, account.ID, until, "rate-limit"))
+	s.Require().NoError(s.repo.SetTempUnschedulable(s.ctx, account.ID, until, "spending-limit"))
+
+	got, err := s.repo.GetByID(s.ctx, account.ID)
+	s.Require().NoError(err)
+	s.Require().Equal("spending-limit", got.TempUnschedulableReason)
+	s.Require().NotNil(got.TempUnschedulableUntil)
+	s.Require().WithinDuration(until, *got.TempUnschedulableUntil, time.Second)
+}
+
 func (s *AccountRepoSuite) TestClearModelRateLimits_SyncsSchedulerSnapshot() {
 	account := mustCreateAccount(s.T(), s.client, &service.Account{
 		Name: "acc-clear-model-rate",

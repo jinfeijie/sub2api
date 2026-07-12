@@ -1473,28 +1473,72 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesNonRateLimitStates(t *test
 		name            string
 		status          int
 		headers         http.Header
+		body            []byte
+		extra           map[string]any
 		wantReason      string
+		wantKeyword     string
+		wantStatusCode  int
 		wantMinCooldown time.Duration
 		wantMaxCooldown time.Duration
+		wantExactUntil  time.Time
 	}{
 		{
 			name:            "unauthorized reauth",
 			status:          http.StatusUnauthorized,
-			wantReason:      "grok credentials unauthorized",
+			wantReason:      "grok oauth token unauthorized",
+			wantKeyword:     "unauthorized",
+			wantStatusCode:  http.StatusUnauthorized,
 			wantMinCooldown: 10*time.Minute - time.Second,
 			wantMaxCooldown: 10*time.Minute + time.Second,
 		},
 		{
-			name:            "forbidden entitlement",
+			name:            "forbidden entitlement without spending-limit body",
 			status:          http.StatusForbidden,
-			wantReason:      "grok access or entitlement denied",
+			body:            []byte(`{"code":"forbidden","error":"subscription tier denied"}`),
+			wantReason:      "subscription tier denied",
+			wantKeyword:     "forbidden",
+			wantStatusCode:  http.StatusForbidden,
 			wantMinCooldown: 30*time.Minute - time.Second,
 			wantMaxCooldown: 30*time.Minute + time.Second,
+		},
+		{
+			name:   "forbidden spending-limit with weekly exhausted snapshot",
+			status: http.StatusForbidden,
+			body:   []byte(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`),
+			extra: map[string]any{
+				grokBillingExtraKey: map[string]any{
+					"usage_percent":       100.0,
+					"period_end":          "2099-01-15T12:00:00Z",
+					"used_percent":        26.5,
+					"monthly_limit_cents": 15000,
+				},
+			},
+			wantReason:     "personal-team-blocked:spending-limit",
+			wantKeyword:    "personal-team-blocked:spending-limit",
+			wantStatusCode: http.StatusForbidden,
+			wantExactUntil: time.Date(2099, 1, 15, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			name:   "forbidden spending-limit uses known reset even before snapshot reaches 100 percent",
+			status: http.StatusForbidden,
+			body:   []byte(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`),
+			extra: map[string]any{
+				grokBillingExtraKey: map[string]any{
+					"usage_percent": 33.0,
+					"period_end":    "2099-01-15T12:00:00Z",
+				},
+			},
+			wantReason:     "personal-team-blocked:spending-limit",
+			wantKeyword:    "personal-team-blocked:spending-limit",
+			wantStatusCode: http.StatusForbidden,
+			wantExactUntil: time.Date(2099, 1, 15, 12, 0, 0, 0, time.UTC),
 		},
 		{
 			name:            "upstream temporary error",
 			status:          http.StatusInternalServerError,
 			wantReason:      "grok upstream temporary error",
+			wantKeyword:     "upstream_5xx",
+			wantStatusCode:  http.StatusInternalServerError,
 			wantMinCooldown: 2*time.Minute - time.Second,
 			wantMaxCooldown: 2*time.Minute + time.Second,
 		},
@@ -1502,18 +1546,31 @@ func TestHandleGrokAccountUpstreamErrorTempUnschedulesNonRateLimitStates(t *test
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			account := &Account{ID: 61, Platform: PlatformGrok, Type: AccountTypeOAuth}
+			account := &Account{ID: 61, Platform: PlatformGrok, Type: AccountTypeOAuth, Extra: tt.extra}
 			repo := &grokQuotaAccountRepo{}
 			svc := &OpenAIGatewayService{accountRepo: repo}
 			before := time.Now()
 
-			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, nil)
+			svc.handleGrokAccountUpstreamError(context.Background(), account, tt.status, tt.headers, tt.body)
 
 			require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 			require.Equal(t, 1, repo.tempUnschedCalls)
 			require.Zero(t, repo.rateLimitedCalls)
 			require.Equal(t, account.ID, repo.lastTempUnschedID)
-			require.Equal(t, tt.wantReason, repo.lastTempUnschedReason)
+
+			var state TempUnschedState
+			require.NoError(t, json.Unmarshal([]byte(repo.lastTempUnschedReason), &state))
+			require.Equal(t, tt.wantStatusCode, state.StatusCode)
+			require.Equal(t, tt.wantKeyword, state.MatchedKeyword)
+			require.Equal(t, -1, state.RuleIndex)
+			require.NotZero(t, state.TriggeredAtUnix)
+			require.Contains(t, state.ErrorMessage, tt.wantReason)
+
+			if !tt.wantExactUntil.IsZero() {
+				require.WithinDuration(t, tt.wantExactUntil, repo.lastTempUnschedUntil, time.Second)
+				require.Equal(t, tt.wantExactUntil.Unix(), state.UntilUnix)
+				return
+			}
 			require.True(t, repo.lastTempUnschedUntil.After(before.Add(tt.wantMinCooldown)))
 			require.True(t, repo.lastTempUnschedUntil.Before(before.Add(tt.wantMaxCooldown)))
 		})
@@ -1591,6 +1648,47 @@ func TestGrokRateLimitResetAtUsesFutureWindowAfterRetryAfterExpires(t *testing.T
 
 	require.True(t, limited)
 	require.WithinDuration(t, windowReset, resetAt, time.Second)
+}
+
+func TestGrokSpendingLimitMatchedKeyword(t *testing.T) {
+	require.Equal(t, "personal-team-blocked:spending-limit", grokSpendingLimitMatchedKeyword([]byte(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits"}`)))
+	require.Equal(t, "run out of credits", grokSpendingLimitMatchedKeyword([]byte(`{"error":"run out of credits"}`)))
+	require.Empty(t, grokSpendingLimitMatchedKeyword([]byte(`{"code":"forbidden","error":"subscription required"}`)))
+	require.Empty(t, grokSpendingLimitMatchedKeyword(nil))
+}
+
+func TestResolveGrokSpendingLimitUntilUsesObservedExhaustedWindow(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	account := &Account{Extra: map[string]any{
+		grokBillingExtraKey: map[string]any{
+			"period_end":         "2026-07-15T12:00:00Z",
+			"billing_period_end": "2026-08-01T00:00:00Z",
+			"usage_percent":      100.0,
+			"used_percent":       20.0,
+		},
+	}}
+
+	until, reason, ok := resolveGrokSpendingLimitUntil(account, now)
+	require.True(t, ok)
+	require.Equal(t, time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC), until)
+	require.Equal(t, "grok weekly spending limit exhausted", reason)
+}
+
+func TestResolveGrokSpendingLimitUntilUsesLatestResetWhenWindowUnknown(t *testing.T) {
+	now := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+	account := &Account{Extra: map[string]any{
+		grokBillingExtraKey: map[string]any{
+			"period_end":         "2026-07-15T12:00:00Z",
+			"billing_period_end": "2026-08-01T00:00:00Z",
+			"usage_percent":      40.0,
+			"used_percent":       20.0,
+		},
+	}}
+
+	until, reason, ok := resolveGrokSpendingLimitUntil(account, now)
+	require.True(t, ok)
+	require.Equal(t, time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), until)
+	require.Equal(t, "grok monthly spending limit exhausted", reason)
 }
 
 func TestHandleGrokAccountUpstreamError429DoesNotShortenExistingPause(t *testing.T) {

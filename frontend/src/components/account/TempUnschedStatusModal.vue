@@ -177,6 +177,8 @@ const isActive = computed(() => {
 
 const ruleIndexDisplay = computed(() => {
   if (!state.value) return '-'
+  // System-level pauses (Grok spending limit / stream timeout) use rule_index = -1.
+  if (state.value.rule_index < 0) return '-'
   return state.value.rule_index + 1
 })
 

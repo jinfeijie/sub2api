@@ -62,6 +62,9 @@ var schedulerNeutralExtraKeyPrefixes = []string{
 var schedulerNeutralExtraKeys = map[string]struct{}{
 	"codex_usage_updated_at":     {},
 	"session_window_utilization": {},
+	// Grok quota/billing snapshots are observational; probes must not rebuild
+	// scheduler buckets (still sync single-account snapshot via UpdateExtra).
+	"grok_billing_snapshot": {},
 }
 
 const postgresParameterBatchSize = 50000
@@ -1394,7 +1397,7 @@ func (r *accountRepository) SetTempUnschedulable(ctx context.Context, id int64, 
 			updated_at = NOW()
 		WHERE id = $3
 			AND deleted_at IS NULL
-			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until < $1)
+			AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= $1)
 	`, until, reason, id)
 	if err != nil {
 		return err

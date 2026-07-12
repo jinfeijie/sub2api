@@ -22,7 +22,7 @@
             d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
           />
         </svg>
-        {{ t('admin.accounts.usageWindow.grokProbe') }}
+        {{ t('admin.accounts.usageWindow.activeQuery') }}
       </button>
 
       <button
@@ -35,9 +35,6 @@
       </button>
     </div>
 
-    <div v-if="summary" class="text-[10px] text-gray-600 dark:text-gray-300">
-      {{ summary }}
-    </div>
     <div v-if="error" class="truncate text-[10px] text-red-600 dark:text-red-400" :title="error">
       {{ truncatedError }}
     </div>
@@ -48,11 +45,15 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { adminAPI } from '@/api/admin'
-import type { GrokQuotaProbeResult, GrokQuotaWindow } from '@/api/admin/grok'
+import type { GrokQuotaProbeResult } from '@/api/admin/grok'
 import type { Account } from '@/types'
 
 const props = defineProps<{
   account: Account
+}>()
+
+const emit = defineEmits<{
+  probed: [result: GrokQuotaProbeResult]
 }>()
 
 const { t } = useI18n()
@@ -60,55 +61,63 @@ const { t } = useI18n()
 const visible = computed(() => props.account.platform === 'grok' && props.account.type === 'oauth')
 const loading = ref(false)
 const error = ref<string | null>(null)
-const data = ref<GrokQuotaProbeResult | null>(null)
+
+const isTokenFailure = (code?: string, message?: string): boolean => {
+  const c = (code || '').toUpperCase()
+  if (
+    c === 'GROK_QUOTA_TOKEN_UNAVAILABLE' ||
+    c === 'UNAUTHORIZED' ||
+    c.includes('INVALID_GRANT')
+  ) {
+    return true
+  }
+  const m = (message || '').toLowerCase()
+  return (
+    m.includes('refresh token') ||
+    m.includes('access token') ||
+    m.includes('invalid_grant') ||
+    m.includes('token revoked') ||
+    m.includes('unauthorized')
+  )
+}
 
 const extractErrorMessage = (e: unknown): string => {
   const err = e as {
     message?: string
     reason?: string
-    response?: { data?: { message?: string; error?: string } }
+    status?: number
+    response?: { data?: { message?: string; error?: string; reason?: string }; status?: number }
   }
-  return (
+  const code = String(err?.reason ?? err?.response?.data?.reason ?? '')
+  const status = err?.status ?? err?.response?.status
+  const raw =
     err?.message ||
     err?.reason ||
     err?.response?.data?.message ||
     err?.response?.data?.error ||
-    t('common.error')
-  )
-}
+    ''
 
-const formatWindow = (label: string, window?: GrokQuotaWindow | null): string | null => {
-  if (!window || window.limit == null || window.remaining == null) return null
-  return `${label} ${window.remaining}/${window.limit}`
-}
-
-const retryAfterLabel = computed(() => {
-  const seconds = data.value?.snapshot?.retry_after_seconds
-  if (seconds == null || seconds <= 0) return null
-  if (seconds < 60) return `${seconds}s`
-  return `${Math.ceil(seconds / 60)}m`
-})
-
-const summary = computed(() => {
-  const snapshot = data.value?.snapshot
-  if (!data.value) return ''
-  if (!snapshot) return t('admin.accounts.usageWindow.grokNoHeaders')
-  const parts = [
-    formatWindow(t('admin.accounts.usageWindow.grokRequests'), snapshot.requests),
-    formatWindow(t('admin.accounts.usageWindow.grokTokens'), snapshot.tokens)
-  ].filter(Boolean)
-  if (retryAfterLabel.value) {
-    parts.push(t('admin.accounts.usageWindow.grokRetryAfter', { time: retryAfterLabel.value }))
+  if (isTokenFailure(code, raw) || status === 401) {
+    return t('admin.accounts.usageWindow.grokProbeErrorReauth')
   }
-  if (snapshot.entitlement_status) {
-    parts.push(snapshot.entitlement_status)
+  if (code === 'GROK_QUOTA_BILLING_EMPTY' || code === 'GROK_QUOTA_BILLING_PARSE_ERROR') {
+    return t('admin.accounts.usageWindow.grokProbeErrorEmpty')
   }
-  return parts.length > 0 ? parts.join(' | ') : t('admin.accounts.usageWindow.grokNoHeaders')
-})
+  if (status === 429 || code.includes('RATE') || /429|rate.?limit/i.test(raw)) {
+    return t('admin.accounts.usageWindow.grokProbeErrorRateLimit')
+  }
+  if (status === 0 || /network|timeout|econn|failed to fetch/i.test(raw)) {
+    return t('admin.accounts.usageWindow.grokProbeErrorNetwork')
+  }
+  if (code.startsWith('GROK_QUOTA_') || status === 502 || status === 503 || status === 504) {
+    return t('admin.accounts.usageWindow.grokProbeErrorUpstream')
+  }
+  return t('admin.accounts.usageWindow.grokProbeErrorGeneric')
+}
 
 const truncatedError = computed(() => {
   if (!error.value) return ''
-  return error.value.length > 80 ? `${error.value.slice(0, 80)}...` : error.value
+  return error.value.length > 36 ? `${error.value.slice(0, 36)}…` : error.value
 })
 
 const handleProbe = async () => {
@@ -116,7 +125,13 @@ const handleProbe = async () => {
   loading.value = true
   error.value = null
   try {
-    data.value = await adminAPI.grok.queryQuota(props.account.id)
+    const result = await adminAPI.grok.queryQuota(props.account.id)
+    if (result) {
+      emit('probed', result)
+      if (result.persisted === false) {
+        error.value = t('admin.accounts.usageWindow.grokProbePersistWarning')
+      }
+    }
   } catch (e) {
     error.value = extractErrorMessage(e)
   } finally {
@@ -127,7 +142,6 @@ const handleProbe = async () => {
 watch(
   () => props.account.id,
   () => {
-    data.value = null
     error.value = null
     loading.value = false
   }
